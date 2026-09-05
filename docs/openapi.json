@@ -18,7 +18,7 @@
       "description": "staging"
     },
     {
-      "url": "https://vriddhi-mqta.onrender.com",
+      "url": "http://localhost:8000",
       "description": "local development"
     }
   ],
