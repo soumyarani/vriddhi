@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+
+{% block title %}Your {{ store_name }} account is linked{% endblock %}
+{% block preheader %}Your WhatsApp number and {{ store_name }} account are now linked.{% endblock %}
+{% block heading %}Your account is linked{% endblock %}
+{% block subheading %}Hi {{ customer.name }}, your WhatsApp number and your {{ store_name }} account now share one order history.{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 12px 0;">From now on you can:</p>
+<ul style="margin:0 0 16px 20px; padding:0; font-size:14px; line-height:22px; color:#1f2933;">
+  <li>Browse the catalogue and order straight from WhatsApp</li>
+  <li>Pick up a cart you started on the website</li>
+  <li>Track every order and download GST invoices in one place</li>
+</ul>
+
+{% if customer.email %}
+{{ ui.info_panel('Linked email', customer.email) }}
+{% endif %}
+
+{{ ui.button(storefront_url, 'Go to your account') }}
+
+<p style="margin:0; font-size:13px; line-height:21px; color:#667085;">If you did not link this account, reply to this email straight away and we will unlink it.</p>
+{% endblock %}

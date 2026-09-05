@@ -1,0 +1,78 @@
+{% macro button(url, label) %}
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:20px 0;">
+  <tr>
+    <td style="background-color:#0f766e; border-radius:6px;">
+      <a href="{{ url }}" style="display:inline-block; padding:11px 22px; font-size:14px; font-weight:600; color:#ffffff; text-decoration:none;">{{ label }}</a>
+    </td>
+  </tr>
+</table>
+{% endmacro %}
+
+{% macro items_table(items) %}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; margin:8px 0 4px 0;">
+  <tr>
+    <th align="left" style="padding:8px 0; border-bottom:1px solid #e4e7eb; font-size:11px; text-transform:uppercase; letter-spacing:0.6px; color:#667085;">Item</th>
+    <th align="center" style="padding:8px 0; border-bottom:1px solid #e4e7eb; font-size:11px; text-transform:uppercase; letter-spacing:0.6px; color:#667085;">Qty</th>
+    <th align="right" style="padding:8px 0; border-bottom:1px solid #e4e7eb; font-size:11px; text-transform:uppercase; letter-spacing:0.6px; color:#667085;">Amount</th>
+  </tr>
+  {% for item in items %}
+  <tr>
+    <td align="left" style="padding:10px 0; border-bottom:1px solid #f0f1f3; font-size:14px; color:#1f2933;">
+      {{ item.name }}
+      {% if item.variant %}<br /><span style="font-size:12px; color:#667085;">{{ item.variant }}</span>{% endif %}
+    </td>
+    <td align="center" style="padding:10px 0; border-bottom:1px solid #f0f1f3; font-size:14px; color:#475467;">{{ item.quantity }}</td>
+    <td align="right" style="padding:10px 0; border-bottom:1px solid #f0f1f3; font-size:14px; color:#1f2933;">{{ item.line_total | money }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endmacro %}
+
+{% macro totals(order) %}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; margin:4px 0 8px 0;">
+  <tr>
+    <td align="right" style="padding:4px 0; font-size:13px; color:#667085;">Subtotal</td>
+    <td align="right" width="110" style="padding:4px 0; font-size:13px; color:#1f2933;">{{ order.subtotal | money }}</td>
+  </tr>
+  {% if order.discount and order.discount > 0 %}
+  <tr>
+    <td align="right" style="padding:4px 0; font-size:13px; color:#667085;">Discount{% if order.coupon_code %} ({{ order.coupon_code }}){% endif %}</td>
+    <td align="right" style="padding:4px 0; font-size:13px; color:#0f766e;">-{{ order.discount | money }}</td>
+  </tr>
+  {% endif %}
+  <tr>
+    <td align="right" style="padding:4px 0; font-size:13px; color:#667085;">GST</td>
+    <td align="right" style="padding:4px 0; font-size:13px; color:#1f2933;">{{ order.tax | money }}</td>
+  </tr>
+  <tr>
+    <td align="right" style="padding:4px 0; font-size:13px; color:#667085;">Shipping</td>
+    <td align="right" style="padding:4px 0; font-size:13px; color:#1f2933;">{{ order.shipping | money }}</td>
+  </tr>
+  <tr>
+    <td align="right" style="padding:10px 0 0 0; border-top:1px solid #e4e7eb; font-size:14px; font-weight:700; color:#101828;">Total paid</td>
+    <td align="right" style="padding:10px 0 0 0; border-top:1px solid #e4e7eb; font-size:14px; font-weight:700; color:#101828;">{{ order.total | money }}</td>
+  </tr>
+</table>
+{% endmacro %}
+
+{% macro info_panel(title, body) %}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f8f9fb; border:1px solid #e4e7eb; border-radius:6px; margin:16px 0;">
+  <tr>
+    <td style="padding:14px 16px;">
+      <p style="margin:0 0 4px 0; font-size:11px; text-transform:uppercase; letter-spacing:0.6px; color:#667085;">{{ title }}</p>
+      <p style="margin:0; font-size:14px; line-height:21px; color:#1f2933;">{{ body }}</p>
+    </td>
+  </tr>
+</table>
+{% endmacro %}
+
+{% macro address_panel(title, address_text) %}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f8f9fb; border:1px solid #e4e7eb; border-radius:6px; margin:16px 0;">
+  <tr>
+    <td style="padding:14px 16px;">
+      <p style="margin:0 0 4px 0; font-size:11px; text-transform:uppercase; letter-spacing:0.6px; color:#667085;">{{ title }}</p>
+      <p style="margin:0; font-size:14px; line-height:21px; color:#1f2933;">{{ address_text | replace('\n', '<br />' | safe) }}</p>
+    </td>
+  </tr>
+</table>
+{% endmacro %}

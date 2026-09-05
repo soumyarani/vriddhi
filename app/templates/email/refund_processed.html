@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+
+{% block title %}Refund processed for order {{ order.number }}{% endblock %}
+{% block preheader %}Your refund for order {{ order.number }} has been processed.{% endblock %}
+{% block header_note %}Order {{ order.number }}{% endblock %}
+{% block heading %}Your refund is on its way{% endblock %}
+{% block subheading %}Hi {{ customer.name }}, we have processed the refund for order {{ order.number }}.{% endblock %}
+
+{% block content %}
+{{ ui.info_panel('Refund amount', (refund_amount if refund_amount is not none else order.total) | money) }}
+
+{{ ui.items_table(items) }}
+
+<p style="margin:0 0 4px 0; font-size:13px; line-height:21px; color:#667085;">The amount is credited back to the original payment method. Banks usually take 5-7 working days to reflect it on your statement.</p>
+
+{{ ui.button(order.url, 'View your order') }}
+{% endblock %}

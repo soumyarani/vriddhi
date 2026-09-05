@@ -1,162 +1,327 @@
-from __future__ import annotations
+"""Authentication endpoints.
 
-from datetime import datetime, timedelta
+Two separate Google sign-in flows share one token format:
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+* ``/api/auth/google`` — customers. An account is created on first sign-in.
+* ``/api/auth/agent/google`` — staff. The email domain must be allow-listed and
+  a matching ``Agent`` row must already exist; staff accounts are never
+  auto-provisioned from a login.
 
+Every mutation commits explicitly: ``get_db`` only rolls back on error, it does
+not commit for us.
+"""
+
+# NOTE: `from __future__ import annotations` is deliberately absent. The slowapi
+# limiter decorator wraps endpoints with functools.wraps, which keeps slowapi's
+# module globals on the wrapper, so FastAPI cannot resolve string annotations
+# back to these schema classes.
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import APIRouter, Request, Response
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.auth import (
+    create_access_token,
+    decode_access_token,
+    exchange_google_code,
+    get_agent_by_id,
+    get_user_by_id,
+    is_agent_domain_allowed,
+    issue_refresh_token,
+    lookup_hash,
+    resolve_refresh_token,
+    revoke_all_sessions,
+    revoke_refresh_token,
+)
 from app.config import settings
-from app.database import get_db
-from app.deps import get_current_agent, get_current_user
-from app.google_oauth import fetch_google_user
-from app.models import Agent, RefreshToken, User
-from app.rate_limit import RequestRateLimiter
-from app.schemas import GoogleAuthRequest, LogoutRequest, RefreshRequest, TokenPair, UserProfile
-from app.security import create_access_token, create_refresh_token, hash_refresh_token
+from app.dependencies import Credentials, DbSession
+from app.errors import AuthError, PermissionError_
+from app.models.enums import AuthProvider
+from app.models.user import Agent, RefreshToken, User
+from app.rate_limit import limiter
+from app.schemas.auth import (
+    AgentAuthResponse,
+    AgentProfile,
+    AuthResponse,
+    GoogleAuthRequest,
+    LogoutRequest,
+    RefreshRequest,
+    TokenPair,
+    UserProfile,
+)
+from app.schemas.common import AUTH_RESPONSES, MessageResponse
+from app.services import user as user_service
+from app.services.account_merge import link_or_merge_on_google_login
+from logging_config import get_logger
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
-rate_limiter = RequestRateLimiter(max_requests=10, window_seconds=60)
+log = get_logger(__name__)
+
+router = APIRouter(prefix="/api/auth", tags=["auth"], responses=AUTH_RESPONSES)
+
+AUTH_LIMIT = settings.rate_limit_auth
 
 
-def _find_or_create_google_user(db: Session, google_user: dict) -> User:
-    google_id = google_user["id"]
-    email = google_user.get("email")
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    user = db.scalar(select(User).where(User.google_id == google_id))
-    if user:
-        user.email = email or user.email
-        user.name = google_user.get("name") or user.name
-        user.picture_url = google_user.get("picture") or user.picture_url
-        user.auth_provider = "google"
-        db.flush()
-        return user
 
-    if email:
-        user = db.scalar(select(User).where(User.email == email))
-        if user:
-            user.google_id = google_id
-            user.name = google_user.get("name") or user.name
-            user.picture_url = google_user.get("picture") or user.picture_url
-            user.auth_provider = "google"
-            db.flush()
-            return user
+def _device_info(request: Request) -> str | None:
+    return request.headers.get("user-agent")
 
-    user = User(
-        email=email,
-        name=google_user.get("name"),
-        google_id=google_id,
-        picture_url=google_user.get("picture"),
-        auth_provider="google",
-        whatsapp_opt_in=True,
+
+def _token_pair(access_token: str, refresh_token: str) -> TokenPair:
+    return TokenPair(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=settings.access_token_ttl_minutes * 60,
     )
-    db.add(user)
-    db.flush()
-    return user
 
 
-def _issue_tokens(db: Session, user: User, device_info: str | None) -> TokenPair:
-    access_token = create_access_token(subject=str(user.id), actor="user")
-    refresh_token = create_refresh_token()
+def _verified_google_phone(profile: dict[str, Any]) -> str | None:
+    """Pull a phone number out of the Google profile when it is verified.
 
-    refresh_record = RefreshToken(
-        user_id=user.id,
-        token_hash=hash_refresh_token(refresh_token),
-        device_info=(device_info or "")[:255] or None,
-        expires_at=datetime.utcnow() + timedelta(days=settings.refresh_token_expire_days),
-    )
-    db.add(refresh_record)
-    db.flush()
-
-    return TokenPair(access_token=access_token, refresh_token=refresh_token)
-
-
-@router.post("/google", response_model=TokenPair)
-async def google_auth(payload: GoogleAuthRequest, request: Request, db: Session = Depends(get_db)) -> TokenPair:
-    client_ip = request.client.host if request.client else "unknown"
-    if not rate_limiter.allow(f"auth:{client_ip}"):
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
-
-    google_user = await fetch_google_user(payload.code, payload.redirect_uri)
-
-    user = _find_or_create_google_user(db, google_user)
-    token_pair = _issue_tokens(db, user, request.headers.get("user-agent"))
-    db.commit()
-    return token_pair
+    Google only returns this for workspace/People-scoped tokens, so it is
+    usually absent — the merge path below is a no-op in that case.
+    """
+    phone = profile.get("phone_number") or profile.get("phone")
+    if not phone:
+        return None
+    verified = profile.get("phone_number_verified")
+    if verified is False:
+        return None
+    return str(phone)
 
 
-@router.post("/agent/google", response_model=TokenPair)
-async def agent_google_auth(payload: GoogleAuthRequest, request: Request, db: Session = Depends(get_db)) -> TokenPair:
-    client_ip = request.client.host if request.client else "unknown"
-    if not rate_limiter.allow(f"agent-auth:{client_ip}"):
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
-
-    google_user = await fetch_google_user(payload.code, payload.redirect_uri)
-    email = (google_user.get("email") or "").lower()
+async def _google_profile(body: GoogleAuthRequest) -> dict[str, Any]:
+    profile = await exchange_google_code(body.code, body.redirect_uri)
+    email = (profile.get("email") or "").strip().lower()
     if not email:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is required")
+        raise AuthError("Google did not return an email address")
+    if not profile.get("email_verified", True):
+        raise AuthError("Your Google email address is not verified")
+    profile["email"] = email
+    return profile
 
-    allowed = settings.agent_domains
-    if allowed and email.split("@")[-1] not in {d.lstrip("@") for d in allowed}:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Email domain not allowed")
 
-    agent = db.scalar(select(Agent).where(Agent.google_id == google_user["id"]))
-    if not agent:
-        agent = db.scalar(select(Agent).where(Agent.email == email))
+async def _find_refresh_token(db: AsyncSession, raw_token: str) -> RefreshToken | None:
+    stmt = select(RefreshToken).where(RefreshToken.lookup_hash == lookup_hash(raw_token))
+    return (await db.execute(stmt)).scalar_one_or_none()
 
-    if agent:
-        agent.name = google_user.get("name") or agent.name
-        agent.google_id = google_user["id"]
+
+# --------------------------------------------------------------------------
+# Customer login
+# --------------------------------------------------------------------------
+@router.post("/google", response_model=AuthResponse, summary="Customer Google sign-in")
+@limiter.limit(AUTH_LIMIT)
+async def google_login(
+    request: Request,
+    response: Response,
+    body: GoogleAuthRequest,
+    db: DbSession,
+) -> AuthResponse:
+    profile = await _google_profile(body)
+    google_id = profile.get("google_id")
+
+    user: User | None = None
+    if google_id:
+        user = await user_service.get_by_google_id(db, google_id)
+    if user is None:
+        user = await user_service.get_by_email(db, profile["email"])
+
+    is_new_user = user is None
+    if user is None:
+        user = User(
+            email=profile["email"],
+            name=profile.get("name"),
+            google_id=google_id,
+            picture_url=profile.get("picture"),
+            auth_provider=AuthProvider.GOOGLE,
+        )
+        db.add(user)
+        await db.flush()
     else:
-        agent = Agent(name=google_user.get("name") or email.split("@")[0], email=email, google_id=google_user["id"], role="agent", active=True)
-        db.add(agent)
-        db.flush()
+        # An account that started life on WhatsApp is upgraded in place.
+        if google_id and not user.google_id:
+            user.google_id = google_id
+            user.auth_provider = AuthProvider.GOOGLE
+        if not user.email:
+            user.email = profile["email"]
+        if not user.name and profile.get("name"):
+            user.name = profile["name"]
+        if profile.get("picture"):
+            user.picture_url = profile["picture"]
+
+    user.last_login_at = _now()
+    await db.flush()
+
+    merged = False
+    phone = _verified_google_phone(profile)
+    if phone:
+        result = await link_or_merge_on_google_login(db, user, phone)
+        merged = bool(result.get("merged"))
+
+    access_token = create_access_token(user.id, "user")
+    refresh_token = await issue_refresh_token(
+        db, user_id=user.id, device_info=_device_info(request)
+    )
+    await db.commit()
+
+    log.info("customer_login", user_id=user.id, is_new_user=is_new_user, merged=merged)
+    return AuthResponse(
+        tokens=_token_pair(access_token, refresh_token),
+        user=UserProfile.model_validate(user_service.serialize_user(user)),
+        is_new_user=is_new_user,
+        accounts_merged=merged,
+    )
+
+
+# --------------------------------------------------------------------------
+# Staff login
+# --------------------------------------------------------------------------
+@router.post(
+    "/agent/google", response_model=AgentAuthResponse, summary="Staff Google sign-in"
+)
+@limiter.limit(AUTH_LIMIT)
+async def agent_login(
+    request: Request,
+    response: Response,
+    body: GoogleAuthRequest,
+    db: DbSession,
+) -> AgentAuthResponse:
+    profile = await _google_profile(body)
+    email = profile["email"]
+
+    # Fails closed when AGENT_ALLOWED_DOMAINS is unset.
+    if not is_agent_domain_allowed(email):
+        log.warning("agent_login_domain_rejected", email=email)
+        raise PermissionError_("This email domain is not permitted for staff access")
+
+    agent = (
+        await db.execute(select(Agent).where(func.lower(Agent.email) == email))
+    ).scalar_one_or_none()
+
+    # Staff are provisioned by an admin, never by signing in.
+    if agent is None:
+        log.warning("agent_login_unknown_email", email=email)
+        raise AuthError("No staff account exists for this email address")
 
     if not agent.active or agent.deactivated_at is not None:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent is deactivated")
+        raise PermissionError_("This agent account has been deactivated")
 
-    access_token = create_access_token(subject=str(agent.id), actor="agent", role=agent.role)
-    refresh_token = create_refresh_token()
-    db.commit()
-    return TokenPair(access_token=access_token, refresh_token=refresh_token)
+    google_id = profile.get("google_id")
+    if google_id and not agent.google_id:
+        agent.google_id = google_id
+    if profile.get("picture"):
+        agent.picture_url = profile["picture"]
+    agent.last_login_at = _now()
+    await db.flush()
 
+    access_token = create_access_token(agent.id, "agent", role=agent.role)
+    refresh_token = await issue_refresh_token(
+        db, agent_id=agent.id, device_info=_device_info(request)
+    )
+    await db.commit()
 
-@router.post("/refresh", response_model=TokenPair)
-def refresh_tokens(payload: RefreshRequest, request: Request, db: Session = Depends(get_db)) -> TokenPair:
-    token_hash = hash_refresh_token(payload.refresh_token)
-    token_row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
-    now = datetime.utcnow()
-
-    if not token_row or token_row.revoked_at is not None or token_row.expires_at < now:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-
-    token_row.revoked_at = now
-    if token_row.user_id <= 0:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Agent refresh unsupported")
-
-    user = db.get(User, token_row.user_id)
-    if not user or user.deleted_at is not None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-
-    new_pair = _issue_tokens(db, user, request.headers.get("user-agent"))
-    db.commit()
-    return new_pair
+    log.info("agent_login", agent_id=agent.id, role=agent.role)
+    return AgentAuthResponse(
+        tokens=_token_pair(access_token, refresh_token),
+        agent=AgentProfile.model_validate(agent),
+    )
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(payload: LogoutRequest, db: Session = Depends(get_db)) -> None:
-    token_hash = hash_refresh_token(payload.refresh_token)
-    token_row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
-    if token_row and token_row.revoked_at is None:
-        token_row.revoked_at = datetime.utcnow()
-        db.commit()
+# --------------------------------------------------------------------------
+# Rotation
+# --------------------------------------------------------------------------
+@router.post("/refresh", response_model=TokenPair, summary="Rotate a refresh token")
+@limiter.limit(AUTH_LIMIT)
+async def refresh_tokens(
+    request: Request,
+    response: Response,
+    body: RefreshRequest,
+    db: DbSession,
+) -> TokenPair:
+    record = await resolve_refresh_token(db, body.refresh_token)
+
+    if record.user_id is not None:
+        principal = await get_user_by_id(db, record.user_id)
+        if principal is None:
+            raise AuthError("Account no longer exists")
+        access_token = create_access_token(principal.id, "user")
+    elif record.agent_id is not None:
+        agent = await get_agent_by_id(db, record.agent_id)
+        if agent is None:
+            raise AuthError("Agent no longer exists")
+        if not agent.active or agent.deactivated_at is not None:
+            raise PermissionError_("This agent account has been deactivated")
+        access_token = create_access_token(agent.id, "agent", role=agent.role)
+    else:
+        raise AuthError("Refresh token is not bound to an account")
+
+    refresh_token = await issue_refresh_token(
+        db,
+        user_id=record.user_id,
+        agent_id=record.agent_id,
+        device_info=_device_info(request),
+        replaces=record,
+    )
+    await db.commit()
+    return _token_pair(access_token, refresh_token)
 
 
-@router.get("/me", response_model=UserProfile)
-def me(current_user: User = Depends(get_current_user)) -> UserProfile:
-    return UserProfile.model_validate(current_user)
+@router.post("/logout", response_model=MessageResponse, summary="Revoke a session")
+@limiter.limit(AUTH_LIMIT)
+async def logout(
+    request: Request,
+    response: Response,
+    body: LogoutRequest,
+    db: DbSession,
+) -> MessageResponse:
+    # Deliberately idempotent: an unknown or already-revoked token still
+    # returns 200 so a client can always reach a signed-out state.
+    if body.all_devices:
+        record = await _find_refresh_token(db, body.refresh_token)
+        if record is not None:
+            await revoke_all_sessions(
+                db, user_id=record.user_id, agent_id=record.agent_id
+            )
+    else:
+        await revoke_refresh_token(db, body.refresh_token)
+
+    await db.commit()
+    return MessageResponse(detail="Signed out")
 
 
-@router.get("/agent/me")
-def agent_me(current_agent: Agent = Depends(get_current_agent)) -> dict:
-    return {"id": current_agent.id, "email": current_agent.email, "name": current_agent.name, "role": current_agent.role}
+# --------------------------------------------------------------------------
+# Whoami
+# --------------------------------------------------------------------------
+@router.get(
+    "/me",
+    response_model=UserProfile | AgentProfile,
+    summary="Profile for the bearer token",
+)
+async def me(credentials: Credentials, db: DbSession) -> Any:
+    if credentials is None or not credentials.credentials:
+        raise AuthError("Missing bearer token")
+
+    claims = decode_access_token(credentials.credentials)
+    subject = claims.get("sub")
+    if subject is None:
+        raise AuthError("Malformed token")
+
+    if claims.get("typ") == "agent":
+        agent = await get_agent_by_id(db, int(subject))
+        if agent is None:
+            raise AuthError("Agent no longer exists")
+        if not agent.active or agent.deactivated_at is not None:
+            raise PermissionError_("This agent account has been deactivated")
+        return AgentProfile.model_validate(agent)
+
+    user = await get_user_by_id(db, int(subject))
+    if user is None:
+        raise AuthError("Account no longer exists")
+    return UserProfile.model_validate(user_service.serialize_user(user))

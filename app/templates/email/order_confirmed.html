@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+
+{% block title %}Order {{ order.number }} confirmed{% endblock %}
+{% block preheader %}We have received your payment for order {{ order.number }}.{% endblock %}
+{% block header_note %}Order {{ order.number }}{% endblock %}
+{% block heading %}Thanks, {{ customer.name }} — your order is confirmed{% endblock %}
+{% block subheading %}We have received your payment and started preparing order {{ order.number }}{% if order.placed_at %}, placed on {{ order.placed_at }}{% endif %}.{% endblock %}
+
+{% block content %}
+{{ ui.items_table(items) }}
+{{ ui.totals(order) }}
+
+{% if order.delivery_eta %}
+{{ ui.info_panel('Estimated delivery', order.delivery_eta) }}
+{% endif %}
+
+{{ ui.address_panel('Delivering to', address_text) }}
+
+{{ ui.button(order.url, 'View your order') }}
+
+<p style="margin:0; font-size:13px; line-height:21px; color:#667085;">Your GST tax invoice will be attached once the order ships. You can also download it any time from your order page.</p>
+{% endblock %}

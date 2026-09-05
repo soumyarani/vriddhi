@@ -1,0 +1,101 @@
+# WhatsApp Commerce Platform - local / single-host stack.
+#
+# Usage:
+#   cp .env.example .env   # then fill in the CHANGE_ME_ values
+#   docker compose up --build
+#
+# Secrets are never inlined here; everything comes from .env via env_file.
+# The only values set inline are DATABASE_URL and REDIS_URL, which must be
+# overridden because .env points at localhost (correct when running the app on
+# the host) whereas containers reach each other by compose service name.
+
+name: whatsapp-commerce
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: whatsapp_commerce
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -d/-U qualified so the probe fails if the app database is missing,
+      # not merely when the postmaster is accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d whatsapp_commerce"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Appendonly keeps the arq job queue durable across restarts.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whatsapp-commerce:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Compose service hostnames, overriding the localhost defaults in .env.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/whatsapp_commerce
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # The api container owns schema migration; worker waits on it so the two
+    # never race to apply the same revision.
+    command:
+      - sh
+      - -c
+      - |
+        alembic upgrade head
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whatsapp-commerce:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/whatsapp_commerce
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    # Background jobs only (catalogue sync, abandoned-cart nudges, invoice
+    # generation, reservation expiry). No inbound port.
+    command: ["arq", "app.workers.settings.WorkerSettings"]
+
+volumes:
+  pgdata:
+  redisdata:

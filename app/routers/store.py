@@ -1,682 +1,572 @@
-from __future__ import annotations
+"""Customer-facing storefront API.
 
-from datetime import datetime, timedelta
+Thin HTTP layer over ``app/services``: parse, delegate, commit, return. All
+ownership checks live in the services (an order or address that belongs to
+someone else raises ``NotFoundError``, not 403, so IDs cannot be probed) — no
+endpoint here reaches past them into the ORM.
+
+``get_db`` does not commit, so every mutating endpoint commits explicitly.
+"""
+
+# NOTE: `from __future__ import annotations` is deliberately absent. The slowapi
+# limiter decorator wraps endpoints with functools.wraps, which keeps slowapi's
+# module globals on the wrapper, so FastAPI cannot resolve string annotations
+# back to these schema classes.
 from decimal import Decimal
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Body, Query, Request, Response
+from fastapi.responses import Response as RawResponse
 
-from app.cache import cache_delete, cache_get_json, cache_set_json
 from app.config import settings
-from app.database import get_db
-from app.deps import get_current_user
-from app.models import (
-    Address,
-    Cart,
-    CartItem,
-    Category,
-    Coupon,
-    CouponUsage,
-    InventoryReservation,
-    Order,
-    OrderItem,
-    Payment,
-    Product,
-    ProductVariant,
-    RefreshToken,
-    Review,
-    ShippingConfig,
-    User,
-    Wishlist,
-)
-from app.pagination import next_cursor, parse_cursor
-from app.rate_limit import RequestRateLimiter
-from app.schemas import (
-    AddressIn,
-    CartItemCreate,
+from app.dependencies import CurrentUser, DbSession, OptionalUser, PageLimit
+from app.rate_limit import limiter
+from app.schemas.cart import (
+    ApplyCouponRequest,
+    CartItemAdd,
     CartItemUpdate,
+    CartOut,
     CheckoutRequest,
-    CheckoutRetryRequest,
-    CouponApplyRequest,
-    OrderStatusRequest,
-    PaginationResponse,
-    ProfileUpdateRequest,
-    ProductDetailOut,
-    ProductOut,
-    ReviewCreateRequest,
-    ShippingEstimateResponse,
-    UserProfile,
-    WhatsAppOptInRequest,
+    CheckoutResponse,
+    ShippingEstimate,
+    ShippingEstimateRequest,
 )
+from app.schemas.common import CUSTOMER_RESPONSES, MessageResponse, Page
+from app.schemas.order import (
+    CancelOrderRequest,
+    OrderDetail,
+    OrderSummary,
+    ReturnOrderRequest,
+)
+from app.schemas.product import CategoryOut, ProductDetail, ProductFilters, ProductSummary
+from app.schemas.review import ReviewOut, WishlistItemOut
+from app.schemas.user import AddressCreate, AddressOut, AddressUpdate, ProfileUpdate, WhatsAppOptIn
+from app.schemas.auth import UserProfile
+from app.services import cart as cart_service
+from app.services import order as order_service
+from app.services import product as product_service
+from app.services import review as review_service
+from app.services import shipping as shipping_service
+from app.services import user as user_service
+from app.services.invoice import generate_invoice, invoice_filename
 
-router = APIRouter(prefix="/api/store", tags=["store"])
-coupon_rate_limiter = RequestRateLimiter(max_requests=settings.coupon_rate_limit_per_minute, window_seconds=60)
+# Catalogue reads are public and so cannot 401, but documenting the customer set
+# router-wide is the honest trade: the overwhelming majority of this surface is
+# authenticated, and an extra documented 401 on a public GET is far less
+# misleading than an undocumented 409 on checkout.
+router = APIRouter(prefix="/api", tags=["store"], responses=CUSTOMER_RESPONSES)
 
-
-def _as_decimal(v) -> Decimal:
-    return v if isinstance(v, Decimal) else Decimal(str(v))
-
-
-def _get_or_create_cart(db: Session, user_id: int) -> Cart:
-    cart = db.scalar(select(Cart).where(Cart.user_id == user_id, Cart.status == "active"))
-    if cart:
-        return cart
-    cart = Cart(user_id=user_id, status="active", expires_at=datetime.utcnow() + timedelta(hours=24))
-    db.add(cart)
-    db.flush()
-    return cart
-
-
-def _line_price(db: Session, item: CartItem) -> Decimal:
-    product = db.get(Product, item.product_id)
-    if not product:
-        return Decimal("0")
-    price = _as_decimal(product.base_price)
-    if item.variant_id:
-        variant = db.get(ProductVariant, item.variant_id)
-        if variant and variant.price_override is not None:
-            price = _as_decimal(variant.price_override)
-    return price * Decimal(item.quantity)
-
-
-def _cart_summary(db: Session, cart: Cart) -> dict:
-    items = db.scalars(select(CartItem).where(CartItem.cart_id == cart.id)).all()
-    subtotal = sum((_line_price(db, item) for item in items), Decimal("0"))
-    discount = Decimal("0")
-    if cart.coupon_id:
-        coupon = db.get(Coupon, cart.coupon_id)
-        if coupon and coupon.active:
-            if coupon.discount_type == "percent":
-                discount = subtotal * (_as_decimal(coupon.discount_value) / Decimal("100"))
-            else:
-                discount = _as_decimal(coupon.discount_value)
-            if coupon.max_discount_amount:
-                discount = min(discount, _as_decimal(coupon.max_discount_amount))
-    total = max(subtotal - discount, Decimal("0"))
-    return {
-        "id": cart.id,
-        "status": cart.status,
-        "coupon_id": cart.coupon_id,
-        "subtotal": str(subtotal.quantize(Decimal("0.01"))),
-        "discount": str(discount.quantize(Decimal("0.01"))),
-        "total": str(total.quantize(Decimal("0.01"))),
-        "items": [
-            {"id": i.id, "product_id": i.product_id, "variant_id": i.variant_id, "quantity": i.quantity, "line_total": str(_line_price(db, i).quantize(Decimal('0.01')))}
-            for i in items
-        ],
-    }
+STORE_LIMIT = settings.rate_limit_store
+# Deliberately tighter than the storefront limit: a coupon code is a secret and
+# an unthrottled apply endpoint is a code-enumeration oracle.
+COUPON_LIMIT = settings.rate_limit_coupon
 
 
-@router.get("/categories")
-def list_categories(
-    _: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
-):
-    cached = cache_get_json("store:categories")
-    if cached and offset == 0 and limit == 50:
-        return cached
-    categories = db.scalars(
-        select(Category)
-        .where(Category.active.is_(True), Category.deleted_at.is_(None))
-        .order_by(Category.sort_order.asc(), Category.id.asc())
-        .offset(offset)
-        .limit(limit)
-    ).all()
-    data = [{"id": c.id, "name": c.name, "description": c.description, "image_url": c.image_url, "sort_order": c.sort_order} for c in categories]
-    if offset == 0 and limit == 50:
-        cache_set_json("store:categories", data, 300)
-    return data
+# --------------------------------------------------------------------------
+# Catalog
+# --------------------------------------------------------------------------
+@router.get("/categories", response_model=list[CategoryOut], summary="List categories")
+@limiter.limit(STORE_LIMIT)
+async def list_categories(request: Request, response: Response, db: DbSession) -> Any:
+    return await product_service.list_categories(db)
 
 
-@router.get("/products", response_model=PaginationResponse)
-def list_products(
-    _: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    category_id: int | None = None,
-    q: str | None = None,
-    min_price: Decimal | None = None,
-    max_price: Decimal | None = None,
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=100),
-):
-    cursor_id = parse_cursor(cursor)
-    query = select(Product).where(Product.active.is_(True), Product.deleted_at.is_(None))
-    if category_id is not None:
-        query = query.where(Product.category_id == category_id)
-    if q:
-        query = query.where(or_(Product.name.ilike(f"%{q}%"), Product.description.ilike(f"%{q}%")))
-    if min_price is not None:
-        query = query.where(Product.base_price >= min_price)
-    if max_price is not None:
-        query = query.where(Product.base_price <= max_price)
-    if cursor_id is not None:
-        query = query.where(Product.id > cursor_id)
-    rows = db.scalars(query.order_by(Product.id.asc()).limit(limit + 1)).all()
-    items = rows[:limit]
-    has_more = len(rows) > limit
-    return PaginationResponse(
-        items=[{"id": p.id, "name": p.name, "description": p.description, "category_id": p.category_id, "base_price": str(p.base_price)} for p in items],
-        next_cursor=next_cursor(items[-1].id if items else None, has_more),
+@router.get("/products", response_model=Page[ProductSummary], summary="Browse products")
+@limiter.limit(STORE_LIMIT)
+async def list_products(
+    request: Request,
+    response: Response,
+    db: DbSession,
+    limit: PageLimit,
+    cursor: str | None = Query(default=None, max_length=512),
+    category_id: int | None = Query(default=None, ge=1),
+    q: str | None = Query(default=None, max_length=200),
+    min_price: Decimal | None = Query(default=None, ge=0),
+    max_price: Decimal | None = Query(default=None, ge=0),
+    min_rating: float | None = Query(default=None, ge=0, le=5),
+    in_stock_only: bool = Query(default=False),
+) -> Any:
+    filters = ProductFilters(
+        category_id=category_id,
+        q=q,
+        min_price=min_price,
+        max_price=max_price,
+        min_rating=min_rating,
+        in_stock_only=in_stock_only,
     )
+    return await product_service.list_products(db, filters, cursor=cursor, limit=limit)
 
 
-@router.get("/products/{id}", response_model=ProductDetailOut)
-def get_product(id: int, _: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cache_key = f"store:product:{id}"
-    cached = cache_get_json(cache_key)
-    if cached:
-        return cached
+@router.get(
+    "/products/search", response_model=Page[ProductSummary], summary="Search products"
+)
+@limiter.limit(STORE_LIMIT)
+async def search_products(
+    request: Request,
+    response: Response,
+    db: DbSession,
+    limit: PageLimit,
+    q: str = Query(min_length=1, max_length=200),
+    cursor: str | None = Query(default=None, max_length=512),
+    category_id: int | None = Query(default=None, ge=1),
+    in_stock_only: bool = Query(default=False),
+) -> Any:
+    filters = ProductFilters(q=q, category_id=category_id, in_stock_only=in_stock_only)
+    return await product_service.list_products(db, filters, cursor=cursor, limit=limit)
 
-    product = db.get(Product, id)
-    if not product or not product.active or product.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    variants = db.scalars(select(ProductVariant).where(ProductVariant.product_id == id)).all()
-    reviews = db.scalars(select(Review).where(Review.product_id == id, Review.deleted_at.is_(None)).order_by(Review.id.desc()).limit(20)).all()
-    payload = {
-        "id": product.id,
-        "name": product.name,
-        "description": product.description,
-        "category_id": product.category_id,
-        "base_price": str(product.base_price),
-        "variants": [
-            {
-                "id": v.id,
-                "sku": v.sku,
-                "name": v.name,
-                "attributes": v.attributes,
-                "price_override": str(v.price_override) if v.price_override is not None else None,
-                "stock": v.stock,
-            }
-            for v in variants
-        ],
-        "reviews": [{"id": r.id, "user_id": r.user_id, "rating": r.rating, "comment": r.comment} for r in reviews],
-    }
-    cache_set_json(cache_key, payload, 120)
+
+@router.get(
+    "/products/{product_id}", response_model=ProductDetail, summary="Product detail"
+)
+@limiter.limit(STORE_LIMIT)
+async def get_product(
+    request: Request, response: Response, product_id: int, db: DbSession
+) -> Any:
+    return await product_service.get_product_detail(db, product_id)
+
+
+@router.get("/products/{product_id}/reviews", summary="Reviews for a product")
+async def list_product_reviews(
+    product_id: int, db: DbSession, limit: PageLimit,
+    cursor: str | None = Query(default=None, max_length=512),
+) -> dict[str, Any]:
+    # No response_model: `review.serialize_review` returns a public projection
+    # (`author`, no user_id/order_id) that does not match `ReviewOut`.
+    return await review_service.list_product_reviews(db, product_id, cursor=cursor, limit=limit)
+
+
+# --------------------------------------------------------------------------
+# Cart
+# --------------------------------------------------------------------------
+@router.get("/cart", response_model=CartOut, summary="Current cart")
+async def get_cart(user: CurrentUser, db: DbSession) -> Any:
+    cart = await cart_service.get_or_create_cart(db, user.id)
+    payload = await cart_service.serialize_cart(db, cart)
+    await db.commit()
     return payload
 
 
-@router.get("/cart")
-def get_cart(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cart = _get_or_create_cart(db, current_user.id)
-    db.commit()
-    return _cart_summary(db, cart)
-
-
-@router.post("/cart/items")
-def add_cart_item(payload: CartItemCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cart = _get_or_create_cart(db, current_user.id)
-    if payload.variant_id:
-        variant = db.get(ProductVariant, payload.variant_id)
-        if not variant or variant.product_id != payload.product_id:
-            raise HTTPException(status_code=400, detail="Invalid variant")
-        if variant.stock < payload.quantity:
-            raise HTTPException(status_code=400, detail="Insufficient stock")
-
-    existing = db.scalar(
-        select(CartItem).where(
-            CartItem.cart_id == cart.id,
-            CartItem.product_id == payload.product_id,
-            CartItem.variant_id.is_(payload.variant_id) if payload.variant_id is None else CartItem.variant_id == payload.variant_id,
-        )
+@router.post("/cart/items", response_model=CartOut, summary="Add an item to the cart")
+async def add_cart_item(body: CartItemAdd, user: CurrentUser, db: DbSession) -> Any:
+    cart = await cart_service.add_item(
+        db, user.id, body.product_id, body.variant_id, body.quantity
     )
-    if existing:
-        existing.quantity += payload.quantity
-    else:
-        db.add(CartItem(cart_id=cart.id, product_id=payload.product_id, variant_id=payload.variant_id, quantity=payload.quantity))
-    db.commit()
-    return _cart_summary(db, cart)
+    payload = await cart_service.serialize_cart(db, cart)
+    await db.commit()
+    return payload
 
 
-@router.put("/cart/items/{id}")
-def update_cart_item(id: int, payload: CartItemUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cart = _get_or_create_cart(db, current_user.id)
-    item = db.get(CartItem, id)
-    if not item or item.cart_id != cart.id:
-        raise HTTPException(status_code=404, detail="Cart item not found")
-    if item.variant_id:
-        variant = db.get(ProductVariant, item.variant_id)
-        if variant and variant.stock < payload.quantity:
-            raise HTTPException(status_code=400, detail="Insufficient stock")
-    item.quantity = payload.quantity
-    db.commit()
-    return _cart_summary(db, cart)
+@router.patch(
+    "/cart/items/{item_id}", response_model=CartOut, summary="Change item quantity"
+)
+async def update_cart_item(
+    item_id: int, body: CartItemUpdate, user: CurrentUser, db: DbSession
+) -> Any:
+    cart = await cart_service.update_item(db, user.id, item_id, body.quantity)
+    payload = await cart_service.serialize_cart(db, cart)
+    await db.commit()
+    return payload
 
 
-@router.delete("/cart/items/{id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_cart_item(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cart = _get_or_create_cart(db, current_user.id)
-    item = db.get(CartItem, id)
-    if item and item.cart_id == cart.id:
-        db.delete(item)
-        db.commit()
+@router.delete(
+    "/cart/items/{item_id}", response_model=CartOut, summary="Remove an item"
+)
+async def remove_cart_item(item_id: int, user: CurrentUser, db: DbSession) -> Any:
+    cart = await cart_service.remove_item(db, user.id, item_id)
+    payload = await cart_service.serialize_cart(db, cart)
+    await db.commit()
+    return payload
 
 
-@router.post("/cart/apply-coupon")
-def apply_coupon(payload: CouponApplyRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not coupon_rate_limiter.allow(f"coupon:{current_user.id}"):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    cart = _get_or_create_cart(db, current_user.id)
-    coupon = db.scalar(select(Coupon).where(func.lower(Coupon.code) == payload.code.lower(), Coupon.deleted_at.is_(None)))
-    if not coupon or not coupon.active:
-        raise HTTPException(status_code=400, detail="Invalid coupon")
-    if coupon.expires_at and coupon.expires_at < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Coupon expired")
-
-    usage_count = db.scalar(select(func.count(CouponUsage.id)).where(CouponUsage.coupon_id == coupon.id)) or 0
-    if coupon.max_uses is not None and usage_count >= coupon.max_uses:
-        raise HTTPException(status_code=400, detail="Coupon usage exceeded")
-    cart.coupon_id = coupon.id
-    db.commit()
-    return _cart_summary(db, cart)
+@router.delete("/cart", response_model=CartOut, summary="Empty the cart")
+async def clear_cart(user: CurrentUser, db: DbSession) -> Any:
+    cart = await cart_service.get_or_create_cart(db, user.id)
+    await cart_service.clear_cart(db, cart)
+    payload = await cart_service.serialize_cart(db, cart)
+    await db.commit()
+    return payload
 
 
-@router.delete("/cart/coupon")
-def remove_coupon(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cart = _get_or_create_cart(db, current_user.id)
-    cart.coupon_id = None
-    db.commit()
-    return _cart_summary(db, cart)
+@router.post("/cart/coupon", response_model=CartOut, summary="Apply a coupon")
+@limiter.limit(COUPON_LIMIT)
+async def apply_coupon(
+    request: Request,
+    response: Response,
+    body: ApplyCouponRequest,
+    user: CurrentUser,
+    db: DbSession,
+) -> Any:
+    cart = await cart_service.apply_coupon(db, user.id, body.code)
+    payload = await cart_service.serialize_cart(db, cart)
+    await db.commit()
+    return payload
 
 
-@router.get("/shipping/estimate", response_model=ShippingEstimateResponse)
-def estimate_shipping(pincode: str, amount: Decimal = Decimal("0"), db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    cfg = db.scalar(select(ShippingConfig).where(ShippingConfig.active.is_(True)).order_by(ShippingConfig.id.asc()))
-    if not cfg:
-        return ShippingEstimateResponse(pincode=pincode, serviceable=False, shipping_cost=Decimal("0"))
-    shipping_cost = _as_decimal(cfg.base_cost)
-    if cfg.free_above_amount and amount >= _as_decimal(cfg.free_above_amount):
-        shipping_cost = Decimal("0")
-    return ShippingEstimateResponse(pincode=pincode, serviceable=True, shipping_cost=shipping_cost)
+@router.delete("/cart/coupon", response_model=CartOut, summary="Remove the coupon")
+async def remove_coupon(user: CurrentUser, db: DbSession) -> Any:
+    cart = await cart_service.remove_coupon(db, user.id)
+    payload = await cart_service.serialize_cart(db, cart)
+    await db.commit()
+    return payload
 
 
-@router.post("/checkout")
-def checkout(payload: CheckoutRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    cart = _get_or_create_cart(db, current_user.id)
-    items = db.scalars(select(CartItem).where(CartItem.cart_id == cart.id)).all()
-    if not items:
-        raise HTTPException(status_code=400, detail="Cart is empty")
-
-    address = db.get(Address, payload.address_id)
-    if not address or address.user_id != current_user.id or not address.is_serviceable:
-        raise HTTPException(status_code=400, detail="Invalid address")
-
-    subtotal = sum((_line_price(db, item) for item in items), Decimal("0"))
-    shipping_cfg = db.scalar(select(ShippingConfig).where(ShippingConfig.active.is_(True)).order_by(ShippingConfig.id.asc()))
-    shipping_cost = _as_decimal(shipping_cfg.base_cost) if shipping_cfg else Decimal("0")
-    tax_amount = (subtotal * Decimal("0.18")).quantize(Decimal("0.01"))
-    discount = Decimal("0")
-    applied_coupon = None
-    if payload.coupon_code:
-        applied_coupon = db.scalar(select(Coupon).where(func.lower(Coupon.code) == payload.coupon_code.lower(), Coupon.active.is_(True), Coupon.deleted_at.is_(None)))
-        if applied_coupon:
-            discount = _as_decimal(applied_coupon.discount_value)
-            if applied_coupon.discount_type == "percent":
-                discount = subtotal * (discount / Decimal("100"))
-    total = max(subtotal + shipping_cost + tax_amount - discount, Decimal("0"))
-
-    order_number = f"ORD-{datetime.utcnow().year}-{int(datetime.utcnow().timestamp() * 1000)}"
-    order = Order(
-        order_number=order_number,
-        user_id=current_user.id,
-        address_snapshot={
-            "line1": address.line1,
-            "line2": address.line2,
-            "city": address.city,
-            "state": address.state,
-            "pincode": address.pincode,
-            "country": address.country,
-        },
-        subtotal=subtotal,
-        shipping_cost=shipping_cost,
-        tax_amount=tax_amount,
-        tax_breakup={"gst": str(tax_amount)},
-        discount_amount=discount,
-        total=total,
-        status="pending_payment",
-    )
-    db.add(order)
-    db.flush()
-
-    for item in items:
-        product = db.get(Product, item.product_id)
-        variant = db.get(ProductVariant, item.variant_id) if item.variant_id else None
-        unit = _line_price(db, CartItem(cart_id=0, product_id=item.product_id, variant_id=item.variant_id, quantity=1))
-        db.add(
-            OrderItem(
-                order_id=order.id,
-                product_id=item.product_id,
-                variant_id=item.variant_id,
-                product_name=product.name if product else "Unknown",
-                variant_name=variant.name if variant else None,
-                quantity=item.quantity,
-                unit_price=unit,
-                tax_rate=Decimal("18"),
-                tax_amount=(unit * Decimal(item.quantity) * Decimal("0.18")).quantize(Decimal("0.01")),
-            )
-        )
-        if variant:
-            if variant.stock < item.quantity:
-                raise HTTPException(status_code=400, detail="Insufficient stock")
-            variant.stock -= item.quantity
-            db.add(
-                InventoryReservation(
-                    cart_id=cart.id,
-                    variant_id=variant.id,
-                    quantity=item.quantity,
-                    expires_at=datetime.utcnow() + timedelta(minutes=settings.payment_link_ttl_minutes),
-                )
-            )
-
-    if applied_coupon:
-        cart.coupon_id = applied_coupon.id
-
-    payment = Payment(
-        order_id=order.id,
-        cashfree_order_id=f"cf_{order.order_number}",
-        amount=total,
-        status="pending",
-        payment_link=f"https://payments.example/{order.order_number}",
-        expires_at=datetime.utcnow() + timedelta(minutes=settings.payment_link_ttl_minutes),
-        idempotency_key=f"checkout-{order.id}-{int(datetime.utcnow().timestamp())}",
-    )
-    db.add(payment)
-
-    for item in items:
-        db.delete(item)
-
-    db.commit()
+# --------------------------------------------------------------------------
+# Checkout
+# --------------------------------------------------------------------------
+def _checkout_payload(order: Any, payment: Any) -> dict[str, Any]:
     return {
         "order_id": order.id,
         "order_number": order.order_number,
+        "total": order.total,
+        "currency": order.currency,
+        "payment_link": getattr(payment, "payment_link", None),
+        "payment_session_id": getattr(payment, "payment_session_id", None),
+        "payment_expires_at": getattr(payment, "expires_at", None),
         "status": order.status,
-        "subtotal": str(subtotal),
-        "shipping_cost": str(shipping_cost),
-        "tax_amount": str(tax_amount),
-        "discount_amount": str(discount),
-        "total": str(total),
-        "payment_link": payment.payment_link,
-        "payment_expires_at": payment.expires_at,
     }
 
 
-@router.post("/checkout/retry")
-def retry_checkout(payload: CheckoutRetryRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    order = db.get(Order, payload.order_id)
-    if not order or order.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    payment = db.scalar(select(Payment).where(Payment.order_id == order.id).order_by(Payment.id.desc()))
-    if payment and payment.status == "paid":
-        raise HTTPException(status_code=400, detail="Order already paid")
-
-    if payment:
-        payment.status = "expired"
-    new_payment = Payment(
-        order_id=order.id,
-        cashfree_order_id=f"cf_{order.order_number}-retry-{int(datetime.utcnow().timestamp())}",
-        amount=order.total,
-        status="pending",
-        payment_link=f"https://payments.example/{order.order_number}?retry=1",
-        expires_at=datetime.utcnow() + timedelta(minutes=settings.payment_link_ttl_minutes),
-        idempotency_key=f"retry-{order.id}-{int(datetime.utcnow().timestamp())}",
+@router.post(
+    "/checkout",
+    response_model=CheckoutResponse,
+    status_code=201,
+    summary="Place an order from the cart",
+)
+async def checkout(body: CheckoutRequest, user: CurrentUser, db: DbSession) -> Any:
+    order, payment = await order_service.checkout(
+        db,
+        user,
+        address_id=body.address_id,
+        new_address=body.new_address,
+        channel="web",
     )
-    db.add(new_payment)
-    db.commit()
-    return {"order_id": order.id, "payment_link": new_payment.payment_link, "expires_at": new_payment.expires_at}
+    payload = _checkout_payload(order, payment)
+    await db.commit()
+    return payload
 
 
-@router.get("/orders", response_model=PaginationResponse)
-def list_orders(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    status_filter: str | None = Query(default=None, alias="status"),
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=100),
-):
-    cursor_id = parse_cursor(cursor)
-    query = select(Order).where(Order.user_id == current_user.id)
-    if status_filter:
-        query = query.where(Order.status == status_filter)
-    if cursor_id is not None:
-        query = query.where(Order.id > cursor_id)
-    rows = db.scalars(query.order_by(Order.id.asc()).limit(limit + 1)).all()
-    items = rows[:limit]
-    has_more = len(rows) > limit
-    return PaginationResponse(
-        items=[
-            {
-                "id": o.id,
-                "order_number": o.order_number,
-                "status": o.status,
-                "total": str(o.total),
-            }
-            for o in items
-        ],
-        next_cursor=next_cursor(items[-1].id if items else None, has_more),
+@router.post(
+    "/orders/{order_id}/retry-payment",
+    response_model=CheckoutResponse,
+    summary="Issue a fresh payment link",
+)
+async def retry_payment(order_id: int, user: CurrentUser, db: DbSession) -> Any:
+    order, payment = await order_service.retry_payment(db, user, order_id)
+    payload = _checkout_payload(order, payment)
+    await db.commit()
+    return payload
+
+
+# --------------------------------------------------------------------------
+# Orders
+# --------------------------------------------------------------------------
+@router.get("/orders", response_model=Page[OrderSummary], summary="My orders")
+async def list_orders(
+    user: CurrentUser,
+    db: DbSession,
+    limit: PageLimit,
+    cursor: str | None = Query(default=None, max_length=512),
+    status: str | None = Query(default=None, max_length=40),
+) -> Any:
+    return await order_service.list_orders(
+        db, user_id=user.id, status=status, cursor=cursor, limit=limit
     )
 
 
-@router.get("/orders/{id}")
-def order_detail(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    order = db.get(Order, id)
-    if not order or order.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Order not found")
-    items = db.scalars(select(OrderItem).where(OrderItem.order_id == order.id)).all()
+@router.get("/orders/{order_id}", response_model=OrderDetail, summary="Order detail")
+async def get_order(order_id: int, user: CurrentUser, db: DbSession) -> Any:
+    order = await order_service.get_user_order(db, user.id, order_id)
+    return await order_service.serialize_order_detail(db, order)
+
+
+@router.post(
+    "/orders/{order_id}/cancel", response_model=OrderDetail, summary="Cancel an order"
+)
+async def cancel_order(
+    order_id: int, body: CancelOrderRequest, user: CurrentUser, db: DbSession
+) -> Any:
+    order = await order_service.get_user_order(db, user.id, order_id)
+    await order_service.cancel_order(db, order, body.reason)
+    await db.commit()
+
+    fresh = await order_service.get_user_order(db, user.id, order_id)
+    return await order_service.serialize_order_detail(db, fresh)
+
+
+@router.post(
+    "/orders/{order_id}/return",
+    response_model=OrderDetail,
+    summary="Request a return",
+)
+async def request_return(
+    order_id: int, body: ReturnOrderRequest, user: CurrentUser, db: DbSession
+) -> Any:
+    order = await order_service.get_user_order(db, user.id, order_id)
+    await order_service.request_return(db, order, body.reason)
+    await db.commit()
+
+    fresh = await order_service.get_user_order(db, user.id, order_id)
+    return await order_service.serialize_order_detail(db, fresh)
+
+
+@router.get(
+    "/orders/{order_id}/invoice",
+    response_class=RawResponse,
+    responses={200: {"content": {"application/pdf": {}}, "description": "Invoice PDF"}},
+    summary="Download the GST invoice",
+)
+async def download_invoice(
+    order_id: int, user: CurrentUser, db: DbSession
+) -> RawResponse:
+    # Ownership is resolved first so the PDF generator is never reached with
+    # someone else's order id.
+    order = await order_service.get_user_order(db, user.id, order_id)
+    pdf = await generate_invoice(db, order.id)
+    filename = invoice_filename(order.order_number)
+    return RawResponse(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# --------------------------------------------------------------------------
+# Reviews
+# --------------------------------------------------------------------------
+@router.get("/reviews/pending", summary="Items I can still review")
+async def pending_reviews(user: CurrentUser, db: DbSession) -> list[dict[str, Any]]:
+    return await review_service.reviewable_items(db, user.id)
+
+
+@router.get("/reviews/mine", summary="My reviews")
+async def my_reviews(
+    user: CurrentUser,
+    db: DbSession,
+    limit: PageLimit,
+    cursor: str | None = Query(default=None, max_length=512),
+) -> dict[str, Any]:
+    return await review_service.list_user_reviews(db, user.id, cursor=cursor, limit=limit)
+
+
+@router.post(
+    "/orders/{order_id}/reviews",
+    response_model=ReviewOut,
+    status_code=201,
+    summary="Review a delivered item",
+)
+async def create_review(
+    order_id: int,
+    user: CurrentUser,
+    db: DbSession,
+    product_id: int = Body(ge=1),
+    rating: int = Body(ge=1, le=5),
+    comment: str | None = Body(default=None, max_length=2000),
+) -> Any:
+    review = await review_service.create_review(
+        db,
+        user_id=user.id,
+        product_id=product_id,
+        order_id=order_id,
+        rating=rating,
+        comment=comment,
+    )
+    await db.commit()
+    return review
+
+
+@router.patch(
+    "/reviews/{review_id}", response_model=ReviewOut, summary="Edit my review"
+)
+async def update_review(
+    review_id: int,
+    user: CurrentUser,
+    db: DbSession,
+    rating: int | None = Body(default=None, ge=1, le=5),
+    comment: str | None = Body(default=None, max_length=2000),
+) -> Any:
+    review = await review_service.update_review(
+        db, user.id, review_id, rating=rating, comment=comment
+    )
+    await db.commit()
+    return review
+
+
+@router.delete(
+    "/reviews/{review_id}", response_model=MessageResponse, summary="Delete my review"
+)
+async def delete_review(review_id: int, user: CurrentUser, db: DbSession) -> Any:
+    await review_service.delete_review(db, user.id, review_id)
+    await db.commit()
+    return MessageResponse(detail="Review deleted")
+
+
+# --------------------------------------------------------------------------
+# Profile
+# --------------------------------------------------------------------------
+@router.get("/profile", response_model=UserProfile, summary="My profile")
+async def get_profile(user: CurrentUser, db: DbSession) -> Any:
+    return user_service.serialize_user(user)
+
+
+@router.patch("/profile", response_model=UserProfile, summary="Update my profile")
+async def update_profile(body: ProfileUpdate, user: CurrentUser, db: DbSession) -> Any:
+    updated = await user_service.update_profile(db, user.id, body)
+    await db.commit()
+    return user_service.serialize_user(updated)
+
+
+@router.patch(
+    "/profile/whatsapp-opt-in",
+    response_model=UserProfile,
+    summary="Toggle WhatsApp messaging",
+)
+async def set_whatsapp_opt_in(
+    body: WhatsAppOptIn, user: CurrentUser, db: DbSession
+) -> Any:
+    updated = await user_service.update_profile(
+        db, user.id, {"whatsapp_opt_in": body.opt_in}
+    )
+    await db.commit()
+    return user_service.serialize_user(updated)
+
+
+# --------------------------------------------------------------------------
+# Addresses
+# --------------------------------------------------------------------------
+@router.get("/addresses", response_model=list[AddressOut], summary="My addresses")
+async def list_addresses(user: CurrentUser, db: DbSession) -> Any:
+    return await user_service.list_addresses(db, user.id)
+
+
+@router.post(
+    "/addresses",
+    response_model=AddressOut,
+    status_code=201,
+    summary="Add an address",
+)
+async def create_address(body: AddressCreate, user: CurrentUser, db: DbSession) -> Any:
+    address = await user_service.create_address(db, user.id, body)
+    await db.commit()
+    return address
+
+
+@router.patch(
+    "/addresses/{address_id}", response_model=AddressOut, summary="Edit an address"
+)
+async def update_address(
+    address_id: int, body: AddressUpdate, user: CurrentUser, db: DbSession
+) -> Any:
+    address = await user_service.update_address(db, user.id, address_id, body)
+    await db.commit()
+    return address
+
+
+@router.delete(
+    "/addresses/{address_id}",
+    response_model=MessageResponse,
+    summary="Delete an address",
+)
+async def delete_address(address_id: int, user: CurrentUser, db: DbSession) -> Any:
+    await user_service.delete_address(db, user.id, address_id)
+    await db.commit()
+    return MessageResponse(detail="Address deleted")
+
+
+@router.post(
+    "/addresses/{address_id}/default",
+    response_model=AddressOut,
+    summary="Set the default address",
+)
+async def set_default_address(
+    address_id: int, user: CurrentUser, db: DbSession
+) -> Any:
+    address = await user_service.set_default_address(db, user.id, address_id)
+    await db.commit()
+    return address
+
+
+# --------------------------------------------------------------------------
+# Wishlist
+# --------------------------------------------------------------------------
+def _wishlist_item(entry: Any) -> dict[str, Any]:
+    product = entry.product
+    images = product.image_urls or []
+    first = images[0] if images else None
+    if isinstance(first, dict):
+        first = first.get("url")
+    live = [v for v in product.variants if v.active and v.deleted_at is None]
     return {
-        "id": order.id,
-        "order_number": order.order_number,
-        "status": order.status,
-        "tracking_number": order.tracking_number,
-        "tracking_url": order.tracking_url,
-        "items": [
-            {
-                "id": i.id,
-                "product_id": i.product_id,
-                "product_name": i.product_name,
-                "quantity": i.quantity,
-                "unit_price": str(i.unit_price),
-            }
-            for i in items
-        ],
+        "id": entry.id,
+        "product_id": entry.product_id,
+        "product_name": product.name,
+        "base_price": float(product.base_price),
+        "image_url": first,
+        "in_stock": any(v.stock > 0 for v in live),
+        "added_at": entry.created_at,
     }
 
 
-@router.post("/orders/{id}/cancel")
-def cancel_order(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    order = db.get(Order, id)
-    if not order or order.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if order.status in {"shipped", "out_for_delivery", "delivered"}:
-        raise HTTPException(status_code=400, detail="Order cannot be cancelled")
-    order.status = "cancelled"
-    order.cancelled_at = datetime.utcnow()
-    db.commit()
-    return {"status": "cancelled"}
+@router.get("/wishlist", response_model=list[WishlistItemOut], summary="My wishlist")
+async def list_wishlist(user: CurrentUser, db: DbSession) -> Any:
+    entries = await user_service.list_wishlist(db, user.id)
+    return [_wishlist_item(entry) for entry in entries]
 
 
-@router.post("/orders/{id}/return")
-def request_return(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    order = db.get(Order, id)
-    if not order or order.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if order.status != "delivered":
-        raise HTTPException(status_code=400, detail="Return allowed only after delivery")
-    order.status = "return_requested"
-    db.commit()
-    return {"status": "return_requested"}
+@router.post(
+    "/wishlist/{product_id}",
+    response_model=WishlistItemOut,
+    status_code=201,
+    summary="Save a product",
+)
+async def add_to_wishlist(product_id: int, user: CurrentUser, db: DbSession) -> Any:
+    entry = await user_service.add_to_wishlist(db, user.id, product_id)
+    await db.commit()
+    return _wishlist_item(entry)
 
 
-@router.get("/orders/{id}/invoice")
-def invoice(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    order = db.get(Order, id)
-    if not order or order.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Order not found")
-    content = f"Invoice for {order.order_number}\nTotal: {order.total}\nGST: {order.tax_amount}\n"
-    return Response(content=content.encode("utf-8"), media_type="application/pdf")
+@router.delete(
+    "/wishlist/{product_id}",
+    response_model=MessageResponse,
+    summary="Remove from wishlist",
+)
+async def remove_from_wishlist(
+    product_id: int, user: CurrentUser, db: DbSession
+) -> Any:
+    await user_service.remove_from_wishlist(db, user.id, product_id)
+    await db.commit()
+    return MessageResponse(detail="Removed from wishlist")
 
 
-@router.post("/orders/{id}/review")
-def submit_review(id: int, payload: ReviewCreateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    order = db.get(Order, id)
-    if not order or order.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if order.status != "delivered":
-        raise HTTPException(status_code=400, detail="Reviews allowed only for delivered orders")
+# --------------------------------------------------------------------------
+# Shipping
+# --------------------------------------------------------------------------
+@router.post(
+    "/shipping/check",
+    response_model=ShippingEstimate,
+    summary="Pincode serviceability and shipping cost",
+)
+@limiter.limit(STORE_LIMIT)
+async def check_pincode(
+    request: Request,
+    response: Response,
+    body: ShippingEstimateRequest,
+    db: DbSession,
+    user: OptionalUser,
+) -> Any:
+    # Anonymous callers get a plain serviceability answer; a signed-in shopper
+    # gets the real quote for what is currently in their cart.
+    weight_grams = 0
+    order_value = Decimal("0.00")
 
-    item_exists = db.scalar(select(OrderItem.id).where(OrderItem.order_id == id, OrderItem.product_id == payload.product_id))
-    if not item_exists:
-        raise HTTPException(status_code=400, detail="Product not part of this order")
+    if user is not None:
+        cart = await cart_service.get_active_cart(db, user.id)
+        if cart is not None and cart.items:
+            weight_grams = cart_service.cart_weight(cart)
+            priced = await cart_service.price_cart(db, cart, pincode=body.pincode)
+            order_value = priced["totals"]["subtotal"]
 
-    existing = db.scalar(select(Review).where(Review.order_id == id, Review.product_id == payload.product_id, Review.user_id == current_user.id, Review.deleted_at.is_(None)))
-    if existing:
-        raise HTTPException(status_code=400, detail="Review already submitted")
-
-    review = Review(
-        user_id=current_user.id,
-        product_id=payload.product_id,
-        order_id=id,
-        rating=payload.rating,
-        comment=payload.comment,
-        verified_purchase=True,
+    estimate = await shipping_service.calculate_shipping(
+        db, body.pincode, weight_grams, order_value
     )
-    db.add(review)
-    db.commit()
-    cache_delete(f"store:product:{payload.product_id}")
-    return {"id": review.id, "rating": review.rating, "comment": review.comment}
-
-
-@router.get("/products/{id}/reviews", response_model=PaginationResponse)
-def list_product_reviews(id: int, _: User = Depends(get_current_user), db: Session = Depends(get_db), cursor: str | None = None, limit: int = Query(default=20, ge=1, le=100)):
-    cursor_id = parse_cursor(cursor)
-    query = select(Review).where(Review.product_id == id, Review.deleted_at.is_(None))
-    if cursor_id is not None:
-        query = query.where(Review.id > cursor_id)
-    rows = db.scalars(query.order_by(Review.id.asc()).limit(limit + 1)).all()
-    items = rows[:limit]
-    has_more = len(rows) > limit
-    return PaginationResponse(items=[{"id": r.id, "user_id": r.user_id, "rating": r.rating, "comment": r.comment} for r in items], next_cursor=next_cursor(items[-1].id if items else None, has_more))
-
-
-@router.get("/profile", response_model=UserProfile)
-def get_profile(current_user: User = Depends(get_current_user)):
-    return UserProfile.model_validate(current_user)
-
-
-@router.put("/profile", response_model=UserProfile)
-def update_profile(payload: ProfileUpdateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if payload.name is not None:
-        current_user.name = payload.name
-    if payload.gstin is not None:
-        current_user.gstin = payload.gstin
-    db.commit()
-    db.refresh(current_user)
-    return UserProfile.model_validate(current_user)
-
-
-@router.get("/profile/addresses")
-def list_addresses(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    addresses = db.scalars(select(Address).where(Address.user_id == current_user.id)).all()
-    return [
-        {
-            "id": a.id,
-            "label": a.label,
-            "line1": a.line1,
-            "line2": a.line2,
-            "city": a.city,
-            "state": a.state,
-            "pincode": a.pincode,
-            "country": a.country,
-            "is_default": a.is_default,
-            "is_serviceable": a.is_serviceable,
-        }
-        for a in addresses
-    ]
-
-
-@router.post("/profile/addresses")
-def add_address(payload: AddressIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    is_serviceable = len(payload.pincode) >= 6
-    address = Address(
-        user_id=current_user.id,
-        label=payload.label,
-        line1=payload.line1,
-        line2=payload.line2,
-        city=payload.city,
-        state=payload.state,
-        pincode=payload.pincode,
-        country=payload.country,
-        is_default=payload.is_default,
-        is_serviceable=is_serviceable,
-    )
-    db.add(address)
-    db.commit()
-    return {"id": address.id, "is_serviceable": address.is_serviceable}
-
-
-@router.put("/profile/addresses/{id}")
-def update_address(id: int, payload: AddressIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    address = db.get(Address, id)
-    if not address or address.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Address not found")
-    address.label = payload.label
-    address.line1 = payload.line1
-    address.line2 = payload.line2
-    address.city = payload.city
-    address.state = payload.state
-    address.pincode = payload.pincode
-    address.country = payload.country
-    address.is_default = payload.is_default
-    address.is_serviceable = len(payload.pincode) >= 6
-    db.commit()
-    return {"id": address.id, "is_serviceable": address.is_serviceable}
-
-
-@router.delete("/profile/addresses/{id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_address(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    address = db.get(Address, id)
-    if address and address.user_id == current_user.id:
-        db.delete(address)
-        db.commit()
-
-
-@router.put("/profile/whatsapp-opt-in")
-def whatsapp_opt_in(payload: WhatsAppOptInRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    current_user.whatsapp_opt_in = payload.whatsapp_opt_in
-    db.commit()
-    return {"whatsapp_opt_in": current_user.whatsapp_opt_in}
-
-
-@router.get("/wishlist", response_model=PaginationResponse)
-def list_wishlist(current_user: User = Depends(get_current_user), db: Session = Depends(get_db), cursor: str | None = None, limit: int = Query(default=20, ge=1, le=100)):
-    cursor_id = parse_cursor(cursor)
-    query = select(Wishlist).where(Wishlist.user_id == current_user.id)
-    if cursor_id is not None:
-        query = query.where(Wishlist.id > cursor_id)
-    rows = db.scalars(query.order_by(Wishlist.id.asc()).limit(limit + 1)).all()
-    items = rows[:limit]
-    has_more = len(rows) > limit
-    return PaginationResponse(
-        items=[{"id": w.id, "product_id": w.product_id, "created_at": w.created_at.isoformat()} for w in items],
-        next_cursor=next_cursor(items[-1].id if items else None, has_more),
-    )
-
-
-@router.post("/wishlist/{product_id}")
-def add_wishlist(product_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    exists = db.scalar(select(Wishlist).where(Wishlist.user_id == current_user.id, Wishlist.product_id == product_id))
-    if not exists:
-        db.add(Wishlist(user_id=current_user.id, product_id=product_id))
-        db.commit()
-    return {"status": "ok"}
-
-
-@router.delete("/wishlist/{product_id}")
-def remove_wishlist(product_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    row = db.scalar(select(Wishlist).where(Wishlist.user_id == current_user.id, Wishlist.product_id == product_id))
-    if row:
-        db.delete(row)
-        db.commit()
-    return {"status": "ok"}
+    await db.commit()
+    return estimate

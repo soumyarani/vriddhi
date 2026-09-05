@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+
+{% block title %}Order {{ order.number }} delivered{% endblock %}
+{% block preheader %}Order {{ order.number }} has been delivered.{% endblock %}
+{% block header_note %}Order {{ order.number }}{% endblock %}
+{% block heading %}Delivered — we hope you love it{% endblock %}
+{% block subheading %}Hi {{ customer.name }}, order {{ order.number }} has been delivered.{% endblock %}
+
+{% block content %}
+{{ ui.items_table(items) }}
+
+{{ ui.address_panel('Delivered to', address_text) }}
+
+{{ ui.button(order.url, 'Rate your purchase') }}
+
+<p style="margin:0; font-size:13px; line-height:21px; color:#667085;">Something not right? You can raise a return from your order page within the return window.</p>
+{% endblock %}

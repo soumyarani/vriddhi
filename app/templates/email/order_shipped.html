@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+
+{% block title %}Order {{ order.number }} has shipped{% endblock %}
+{% block preheader %}Order {{ order.number }} is on its way{% if order.tracking_number %} — tracking {{ order.tracking_number }}{% endif %}.{% endblock %}
+{% block header_note %}Order {{ order.number }}{% endblock %}
+{% block heading %}Your order is on its way{% endblock %}
+{% block subheading %}Hi {{ customer.name }}, order {{ order.number }} has left our warehouse.{% endblock %}
+
+{% block content %}
+{% if order.tracking_number %}
+{{ ui.info_panel('Tracking number', order.tracking_number) }}
+{% endif %}
+{% if order.delivery_eta %}
+{{ ui.info_panel('Expected delivery', order.delivery_eta) }}
+{% endif %}
+
+{{ ui.items_table(items) }}
+
+{{ ui.address_panel('Delivering to', address_text) }}
+
+{% if order.tracking_url %}
+{{ ui.button(order.tracking_url, 'Track your shipment') }}
+{% else %}
+{{ ui.button(order.url, 'View your order') }}
+{% endif %}
+
+<p style="margin:0; font-size:13px; line-height:21px; color:#667085;">Tracking information can take a few hours to appear with the courier.</p>
+{% endblock %}
