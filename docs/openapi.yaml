@@ -119,7 +119,7 @@ servers:
   description: production
 - url: https://staging-api.example.com
   description: staging
-- url: http://localhost:8000
+- url: https://vriddhi-mqta.onrender.com
   description: local development
 paths:
   /health:
