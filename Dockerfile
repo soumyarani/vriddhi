@@ -36,6 +36,7 @@ COPY . .
 # Run unprivileged. Ownership is set in the same layer as user creation so the
 # image does not carry a duplicate copy of /app with different ownership.
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin appuser \
+    && chmod +x /app/entrypoint.sh \
     && chown -R appuser:appuser /app
 USER appuser
 
@@ -45,6 +46,8 @@ EXPOSE 8000
 # probe, which checks database and Redis connectivity as well as process
 # liveness. start-period covers migration time on a cold start.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4).status == 200 else 1)"
+    CMD python -c "import os,sys,urllib.request; port=os.environ.get('PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/health/ready', timeout=4).status == 200 else 1)"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Migrations, the arq worker and the API all start here. See entrypoint.sh for
+# why they share a container; docker-compose.yml still runs them separately.
+CMD ["/app/entrypoint.sh"]
